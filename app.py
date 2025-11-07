@@ -12,7 +12,7 @@ import re
 # ================ APP CONFIG ================
 st.set_page_config(
     page_title="Pendataan SLOG – Dashboard",
-    page_icon="chart",
+    page_icon="📊",
     layout="wide"
 )
 load_dotenv()
@@ -50,13 +50,22 @@ with engine.begin() as conn:
         s = stmt.strip()
         if s:
             conn.execute(text(s))
-    # Seed target
+    # Seed target jika kosong
     cur = conn.execute(text("SELECT COUNT(*) FROM targets"))
     if cur.scalar_one() == 0:
         conn.execute(text("""
             INSERT INTO targets (id, internal_target, eksternal_offline_target, eksternal_online_target, updated_at)
             VALUES (1, 250, 50, 200, :ts)
         """), {"ts": datetime.utcnow().isoformat()})
+    # Migrasi data lama: rename kolom 'n' ke 'total_n' jika ada (kompatibilitas)
+    try:
+        cur = conn.execute(text("PRAGMA table_info(aggregates)"))
+        cols = [row[1] for row in cur.fetchall()]
+        if 'n' in cols and 'total_n' not in cols:
+            conn.execute(text("ALTER TABLE aggregates RENAME COLUMN n TO total_n"))
+            st.sidebar.info("🆕 Migrasi data lama selesai: kolom 'n' → 'total_n'.")
+    except Exception:
+        pass  # Ignore jika gagal migrasi
 
 # ================ HELPERS ================
 @st.cache_data(ttl=20)
@@ -83,12 +92,19 @@ def get_latest_totals(df: pd.DataFrame):
     """Ambil TOTAL terbaru per sumber (berdasarkan input_date terbaru per sumber)"""
     if df.empty:
         return {"internal": 0, "eksternal_offline": 0, "eksternal_online": 0}
+    
+    # Cek kolom 'total_n' ada (untuk kompatibilitas)
+    if 'total_n' not in df.columns:
+        return {"internal": 0, "eksternal_offline": 0, "eksternal_online": 0}
+    
     # Urutkan & ambil yang terbaru per sumber
     latest = df.sort_values("input_date").groupby("source").tail(1)
     totals = {}
     for src in ["internal", "eksternal_offline", "eksternal_online"]:
-        val = latest[latest["source"] == src]["total_n"].iloc[0] if src in latest["source"].values else 0
-        totals[src] = int(val)
+        if src in latest["source"].values:
+            totals[src] = int(latest[latest["source"] == src]["total_n"].iloc[0])
+        else:
+            totals[src] = 0
     return totals
 
 def pie_progress(title, achieved, target):
@@ -104,6 +120,7 @@ def card_metric(title, value, target):
     st.metric(title, value=value, delta=f"Sisa {delta}" if delta >= 0 else f"Lebih {abs(delta)}")
 
 def parse_wib(ts_iso: str) -> str:
+    """Konversi UTC ISO ke WIB (UTC+7) dan format cantik."""
     try:
         dt = datetime.fromisoformat(ts_iso.replace("Z", ""))
     except Exception:
@@ -112,8 +129,9 @@ def parse_wib(ts_iso: str) -> str:
     return dt_wib.strftime("%Y-%m-%d %H:%M WIB")
 
 def build_map_html(df_pts: pd.DataFrame) -> str:
+    """Bangun folium map dan kembalikan HTML string."""
     if df_pts.empty:
-        center = [-6.2, 106.816666]
+        center = [-6.2, 106.816666]  # Jakarta
         m = folium.Map(location=center, zoom_start=11)
         folium.Marker(center, popup="Belum ada titik").add_to(m)
     else:
@@ -126,14 +144,17 @@ def build_map_html(df_pts: pd.DataFrame) -> str:
     return m._repr_html_()
 
 def tolerant_read_csv(file) -> pd.DataFrame:
+    """Baca CSV toleran separator/quote, auto-parse titik->lat/lon bila perlu."""
     df = pd.read_csv(file, engine="python", quotechar='"', sep=None)
     cols = [c.lower().strip() for c in df.columns]
+    
     if "lat" in cols and "lon" in cols:
         df = df.rename(columns={
             df.columns[cols.index("lat")]: "lat",
             df.columns[cols.index("lon")]: "lon"
         })
         return df[["lat", "lon"]].copy()
+    
     if "titik" in cols:
         titik_col = df.columns[cols.index("titik")]
         s = df[titik_col].astype(str)
@@ -141,12 +162,14 @@ def tolerant_read_csv(file) -> pd.DataFrame:
         s = df.astype(str).agg(" ".join, axis=1)
 
     def parse_lat_lon_auto(text):
-        if pd.isna(text): return None, None
+        if pd.isna(text):
+            return None, None
         text = str(text)
         nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
         if len(nums) >= 2:
             return float(nums[0]), float(nums[1])
         return None, None
+    
     parsed = s.apply(parse_lat_lon_auto)
     lat = [p[0] for p in parsed]
     lon = [p[1] for p in parsed]
@@ -158,7 +181,7 @@ if "authed" not in st.session_state:
     st.session_state.authed = False
 
 # ================ SIDEBAR NAV ================
-st.sidebar.title("Navigasi")
+st.sidebar.title("📌 Navigasi")
 page = st.sidebar.radio("Pilih tampilan", ["Dashboard", "Kelola Data (Admin)"], index=0)
 
 if page == "Kelola Data (Admin)" and not st.session_state.authed:
@@ -167,7 +190,7 @@ if page == "Kelola Data (Admin)" and not st.session_state.authed:
     if st.sidebar.button("Masuk"):
         if pwd == ADMIN_PASSWORD:
             st.session_state.authed = True
-            st.sidebar.success("Login berhasil")
+            st.sidebar.success("Login berhasil ✅")
         else:
             st.sidebar.error("Password salah")
 
@@ -190,12 +213,13 @@ if not df_agg.empty:
     last_update = df_agg["created_at"].max()
 
 # ================ HEADER =================
-st.title("Dashboard Progres Pendataan SLOG")
-st.caption("By Firstat • Data diambil dari **total akumulasi terbaru per kanal**")
+st.title("📊 Dashboard Progres Pendataan SLOG")
+st.caption("By Firstat ")
 
 # ================ DASHBOARD =================
 if page == "Dashboard":
-    st.markdown("## Progres Keseluruhan")
+    # ---- PROGRES KESELURUHAN (headline) ----
+    st.markdown("## 🔹 Progres Keseluruhan")
     overall_pct = 0 if total_target <= 0 else min(total_achieved / total_target, 1.0)
     cA, cB = st.columns([1, 3])
     with cA:
@@ -205,8 +229,11 @@ if page == "Dashboard":
 
     if last_update:
         st.caption(f"Terakhir diupdate: **{parse_wib(last_update)}**")
+    else:
+        st.caption("📝 Belum ada data input. Mulai update di menu Admin.")
 
-    st.markdown("## Ringkasan Per Kanal")
+    # ---- METRIK PER KANAL ----
+    st.markdown("## 📈 Ringkasan")
     m1, m2, m3 = st.columns(3)
     with m1:
         card_metric("Internal", tot["internal"], int(targets["internal_target"]))
@@ -215,7 +242,8 @@ if page == "Dashboard":
     with m3:
         card_metric("Eksternal Online", tot["eksternal_online"], int(targets["eksternal_online_target"]))
 
-    st.markdown("## Distribusi Pencapaian")
+    # ---- PIE PROGRESS ----
+    st.markdown("## 🥧 Distribusi Pencapaian")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.plotly_chart(pie_progress("Internal", tot["internal"], int(targets["internal_target"])), use_container_width=True)
@@ -224,9 +252,10 @@ if page == "Dashboard":
     with c3:
         st.plotly_chart(pie_progress("Eksternal Online", tot["eksternal_online"], int(targets["eksternal_online_target"])), use_container_width=True)
 
-    st.markdown("## Peta Titik Responden Eksternal Offline")
+    # ---- MAP (di bawah chart) ----
+    st.markdown("## 🗺️ Peta Titik Responden Eksternal Offline")
     if df_pts.empty:
-        st.info("Belum ada data peta. Admin bisa unggah CSV di menu **Kelola Data (Admin) → Data Peta**.")
+        st.info("Belum ada data peta. Admin bisa unggah CSV pada menu **Kelola Data (Admin) → 🗺️ Data Peta**.")
     else:
         map_html = build_map_html(df_pts)
         st_html(map_html, height=520, scrolling=False)
@@ -234,15 +263,15 @@ if page == "Dashboard":
 # ================ ADMIN =================
 if page == "Kelola Data (Admin)":
     if not st.session_state.authed:
-        st.warning("Masuk sebagai Admin untuk mengelola data.")
+        st.warning("Masuk sebagai Admin untuk mengelola data dan target.")
     else:
-        tab1, tab2, tab3 = st.tabs(["Input Total Akumulasi", "Ubah Target", "Data Peta"])
+        tab1, tab2, tab3 = st.tabs(["➕ Input Total Akumulasi", "🎯 Ubah Target", "🗺️ Data Peta"])
 
         # ---- INPUT TOTAL AKUMULASI ----
         with tab1:
             st.subheader("Update Total Akumulasi per Tanggal Cek")
-            st.caption("Masukkan **total responden sampai hari ini** (bukan tambahan harian).")
-
+            st.caption("**Total responden sampai hari ini** (bukan tambahan harian). Jika tanggal & kanal sudah ada → **diperbarui**.")
+            
             with st.form("form_agg"):
                 colA, colB = st.columns(2)
                 with colA:
@@ -251,7 +280,7 @@ if page == "Kelola Data (Admin)":
                 with colB:
                     total_n = st.number_input("Total Responden (Akumulasi)", min_value=0, step=1, value=0)
                     note = st.text_input("Catatan (opsional)", placeholder="Contoh: data dari lapangan")
-                submit = st.form_submit_button("Simpan Total", type="primary")
+                submit = st.form_submit_button("💾 Simpan Total", type="primary")
 
             if submit:
                 input_date_str = tgl.strftime("%Y-%m-%d")
@@ -274,7 +303,7 @@ if page == "Kelola Data (Admin)":
                             """),
                             {"n": int(total_n), "note": note.strip(), "ts": now_ts, "id": existing[0]}
                         )
-                        st.success(f"Total **{sumber}** pada **{input_date_str}** diperbarui: {old_total} → {total_n}")
+                        st.success(f"Total **{sumber}** pada **{input_date_str}** diperbarui: {old_total} → **{total_n}** ✅")
                     else:
                         conn.execute(
                             text("""
@@ -284,15 +313,15 @@ if page == "Kelola Data (Admin)":
                             {"d": input_date_str, "s": sumber, "n": int(total_n),
                              "note": note.strip(), "ts": now_ts}
                         )
-                        st.success(f"Total **{sumber}** pada **{input_date_str}** disimpan: {total_n}")
+                        st.success(f"Total **{sumber}** pada **{input_date_str}** disimpan: **{total_n}** ✅")
 
                 invalidate()
 
             st.divider()
-            st.subheader("Riwayat Update Total (10 Terbaru)")
+            st.subheader("🧾 Riwayat Update Total (10 Terbaru)")
             df_now = load_aggregates()
             if df_now.empty:
-                st.info("Belum ada data.")
+                st.info("Belum ada data input.")
             else:
                 last_10 = df_now.sort_values("created_at", ascending=False).head(10).copy()
                 last_10["Waktu (WIB)"] = last_10["created_at"].apply(parse_wib)
@@ -305,7 +334,7 @@ if page == "Kelola Data (Admin)":
                 st.dataframe(last_10[["Tanggal Cek", "Kanal", "Total Responden", "Catatan", "Waktu (WIB)"]],
                              use_container_width=True, hide_index=True)
                 csv = df_now.to_csv(index=False).encode("utf-8")
-                st.download_button("Unduh Semua Data (CSV)", data=csv, file_name="slog_totals.csv", mime="text/csv")
+                st.download_button("⬇️ Unduh Semua Data (CSV)", data=csv, file_name="slog_totals.csv", mime="text/csv")
 
         # ---- UBAH TARGET ----
         with tab2:
@@ -319,7 +348,7 @@ if page == "Kelola Data (Admin)":
                     t_off = st.number_input("Target Eksternal Offline", min_value=0, step=1, value=int(cur["eksternal_offline_target"]))
                 with c3:
                     t_on = st.number_input("Target Eksternal Online", min_value=0, step=1, value=int(cur["eksternal_online_target"]))
-                up = st.form_submit_button("Simpan Target")
+                up = st.form_submit_button("💾 Simpan Target")
             if up:
                 with engine.begin() as conn:
                     conn.execute(text("""
@@ -328,49 +357,71 @@ if page == "Kelola Data (Admin)":
                         WHERE id=1
                     """), {"a": int(t_int), "b": int(t_off), "c": int(t_on), "ts": datetime.utcnow().isoformat()})
                 invalidate()
-                st.success("Target diperbarui")
+                st.success("Target diperbarui ✅")
 
         # ---- DATA PETA ----
         with tab3:
             st.subheader("Unggah CSV Titik (lat/lon atau kolom 'titik')")
-            replace = st.checkbox("Ganti semua titik lama (replace)", value=True)
+            replace = st.checkbox("Ganti semua titik lama (replace)", value=True,
+                                  help="Centang = hapus semua titik lama sebelum tambah baru. Tidak dicentang = tambah titik baru saja.")
             file = st.file_uploader("Pilih file CSV", type=["csv"])
 
             if file is not None:
                 try:
                     pts = tolerant_read_csv(file)
                     pts = pts.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+
                     if pts.empty:
-                        st.warning("Tidak ada titik valid.")
+                        st.warning("Tidak ada data lat/lon yang valid di file CSV.")
                     else:
-                        st.success(f"Berhasil baca **{len(pts)}** titik.")
+                        st.success(f"Terbaca **{len(pts)}** titik.")
                         st.dataframe(pts.head(10), use_container_width=True, hide_index=True)
 
-                        preview = f"Akan **{'menggantikan semua' if replace else 'menambahkan'}** {len(pts)} titik."
+                        # Preview jumlah titik yang akan disimpan
+                        preview_text = f"Akan **{'mengganti semua' if replace else 'menambahkan'}** {len(pts)} titik."
                         if replace and not df_pts.empty:
-                            preview += f" (hapus {len(df_pts)} titik lama)"
-                        st.info(preview)
+                            preview_text += f" (akan menghapus {len(df_pts)} titik lama)"
+                        st.info(preview_text)
 
-                        if st.button("Simpan ke Peta", type="primary"):
+                        if st.button("💾 Simpan ke Peta", type="primary"):
                             with engine.begin() as conn:
+                                # 1. Hapus data lama JIKA replace=True
                                 if replace:
                                     conn.execute(text("DELETE FROM map_points"))
+                                    st.info("Semua titik lama dihapus.")
+
+                                # 2. Insert titik baru (batch)
                                 now = datetime.utcnow().isoformat()
                                 rows = [
-                                    {"lat": float(r.lat), "lon": float(r.lon), "label": None, "created_at": now}
+                                    {
+                                        "lat": float(r.lat),
+                                        "lon": float(r.lon),
+                                        "label": None,
+                                        "created_at": now
+                                    }
                                     for r in pts.itertuples(index=False)
                                 ]
                                 if rows:
-                                    conn.execute(text("""
-                                        INSERT INTO map_points (lat, lon, label, created_at)
-                                        VALUES (:lat, :lon, :label, :created_at)
-                                    """), rows)
+                                    conn.execute(
+                                        text("""
+                                            INSERT INTO map_points (lat, lon, label, created_at)
+                                            VALUES (:lat, :lon, :label, :created_at)
+                                        """),
+                                        rows
+                                    )
                                     action = "diganti" if replace else "ditambahkan"
-                                    st.success(f"{len(rows)} titik berhasil **{action}**")
-                            invalidate()
-                except Exception as e:
-                    st.error(f"Gagal baca CSV: {e}")
+                                    st.success(f"{len(rows)} titik berhasil **{action}** ke peta ✅")
+                                else:
+                                    st.warning("Tidak ada data untuk disimpan.")
 
-        if st.button("Keluar dari Mode Admin"):
+                            # Refresh cache
+                            invalidate()
+
+                except Exception as e:
+                    st.error(f"Gagal membaca CSV: {e}")
+                    st.code(str(e))
+
+        st.markdown("---")
+        if st.button("🚪 Keluar dari Mode Admin"):
             st.session_state.authed = False
             st.rerun()
